@@ -35,14 +35,15 @@ use aurae_proto::cri::{
     runtime_service_server, AttachRequest, AttachResponse,
     CheckpointContainerRequest, CheckpointContainerResponse,
     ContainerEventResponse, ContainerStatsRequest, ContainerStatsResponse,
-    ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
-    CreateContainerResponse, ExecRequest, ExecResponse, ExecSyncRequest,
-    ExecSyncResponse, GetEventsRequest, ListContainerStatsRequest,
-    ListContainerStatsResponse, ListContainersRequest, ListContainersResponse,
+    ContainerStatus, ContainerStatusRequest, ContainerStatusResponse,
+    CreateContainerRequest, CreateContainerResponse, ExecRequest, ExecResponse,
+    ExecSyncRequest, ExecSyncResponse, GetEventsRequest,
+    ListContainerStatsRequest, ListContainerStatsResponse,
+    ListContainersRequest, ListContainersResponse,
     ListMetricDescriptorsRequest, ListMetricDescriptorsResponse,
     ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
-    ListPodSandboxStatsResponse, PodSandboxStatsRequest,
+    ListPodSandboxStatsResponse, PodSandbox, PodSandboxStatsRequest,
     PodSandboxStatsResponse, PodSandboxStatusRequest, PodSandboxStatusResponse,
     PortForwardRequest, PortForwardResponse, RemoveContainerRequest,
     RemoveContainerResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
@@ -54,12 +55,16 @@ use aurae_proto::cri::{
     UpdateContainerResourcesResponse, UpdateRuntimeConfigRequest,
     UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
-use libcontainer;
-use libcontainer::container::builder::ContainerBuilder;
+use chrono::Utc;
+use libcontainer::container::{builder::ContainerBuilder, Container};
 use libcontainer::syscall::syscall::create_syscall;
-use std::path::Path;
+use nix::sys::signal::Signal;
+use std::{path::Path, sync::Arc};
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+use super::{error::RuntimeServiceError, sandbox_cache::SandboxCache};
 
 // The string to refer to the nested runtime spaces for recursive Auraed environments.
 const AURAE_SELF_IDENTIFIER: &str = "_aurae";
@@ -71,11 +76,13 @@ const AURAE_PODS_PATH: &str = "/var/run/aurae/pods";
 const AURAE_BUNDLE_PATH: &str = "/var/run/aurae/bundles";
 
 #[derive(Debug, Clone)]
-pub struct RuntimeService {}
+pub struct RuntimeService {
+    sandboxes: Arc<Mutex<SandboxCache>>,
+}
 
 impl RuntimeService {
     pub fn new() -> Self {
-        RuntimeService {}
+        RuntimeService { sandboxes: Default::default() }
     }
 }
 
@@ -93,6 +100,8 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         &self,
         request: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        // TODO: RuntimeServiceErrors
+
         // Handle Request
         let r = request.into_inner();
         // Handle Config
@@ -104,6 +113,7 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         }
         // Extract the metadata (name, uid, etc)
         let metadata = config.clone().metadata.expect("metadata from config");
+        let sandbox_id = metadata.name;
         // Extract the Linux config (OCI and runtime parameters, security context, etc)
         let _linux =
             config.clone().linux.expect("linux from pod sandbox config");
@@ -115,72 +125,111 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         // TODO Switch on "WASM" which is a field that we will add to the RunPodSandboxRequest
         // TODO We made the decision to create a "KernelSpec" *name structure that will be how we distinguish between VMs and Containers
 
-        // Initialize a new container builder with the AURAE_SELF_IDENTIFIER name as the "init" container running a recursive Auraed
-        let syscall = create_syscall();
-        let sandbox_builder = ContainerBuilder::new(
-            AURAE_SELF_IDENTIFIER.to_string(),
-            syscall.as_ref(),
-        );
+        let mut sandbox: Option<Container>;
+        {
+            // Initialize a new container builder with the AURAE_SELF_IDENTIFIER name as the "init" container running a recursive Auraed
+            let syscall = create_syscall();
+            let sandbox_builder = ContainerBuilder::new(
+                AURAE_SELF_IDENTIFIER.to_string(),
+                syscall.as_ref(),
+            );
 
-        // Spawn auraed here
-        // TODO Check if sandbox already exists?
-        let _spawned = spawn_auraed_oci_to(
-            Path::new(AURAE_BUNDLE_PATH)
-                .join(AURAE_SELF_IDENTIFIER)
-                .to_str()
-                .expect("recursive path"),
-            oci_builder.build().expect("building pod oci spec"),
-        );
+            // Spawn auraed here
+            // TODO Check if sandbox already exists and if it does, clean up to this point?
+            let _spawned = spawn_auraed_oci_to(
+                Path::new(AURAE_BUNDLE_PATH)
+                    .join(AURAE_SELF_IDENTIFIER)
+                    .to_str()
+                    .expect("recursive path"),
+                oci_builder.build().expect("building pod oci spec"),
+            );
 
-        let sandbox_id = metadata.name;
-        let mut sandbox = sandbox_builder
-            .with_root_path(Path::new(AURAE_PODS_PATH).join(sandbox_id.clone()))
-            .expect("Setting pods directory")
-            .as_init(Path::new(AURAE_BUNDLE_PATH).join(AURAE_SELF_IDENTIFIER))
-            .with_systemd(false)
-            .build()
-            .expect("failed building pod sandbox: ensure valid OCI spec and proper container starting point");
+            sandbox = Some(sandbox_builder
+                .with_root_path(Path::new(AURAE_PODS_PATH).join(sandbox_id.clone()))
+                .expect("Setting pods directory")
+                .as_init(Path::new(AURAE_BUNDLE_PATH).join(AURAE_SELF_IDENTIFIER))
+                .with_systemd(false)
+                .build()
+                .expect("failed building pod sandbox: ensure valid OCI spec and proper container starting point"));
 
-        sandbox.start().expect("starting pod sandbox");
+            sandbox
+                .as_mut()
+                .expect("a sandbox")
+                .start()
+                .expect("starting pod sandbox");
+        }
 
-        // TODO: Cache sandbox
+        // NOTE: we're creating a libcontainer::container and calling it `sandbox`,
+        // so that's what goes in the cache.  but i think the rest of this service
+        // differentiates between the outer "pod" and the inner "container"s so we
+        // might want to do the same.
+        let mut sandboxes = self.sandboxes.lock().await;
+        sandboxes.add(sandbox_id.clone(), sandbox.expect("a sandbox"))?;
 
         Ok(Response::new(RunPodSandboxResponse { pod_sandbox_id: sandbox_id }))
     }
 
     async fn stop_pod_sandbox(
         &self,
-        _request: Request<StopPodSandboxRequest>,
+        request: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
-        // TODO: Pull sandbox from cache
-        // TODO: sandbox.kill()
-        todo!()
+        let sandbox_id = request.into_inner().pod_sandbox_id;
+
+        let mut sandboxes = self.sandboxes.lock().await;
+        let sandbox = sandboxes.get_mut(&sandbox_id)?;
+        sandbox.kill(Signal::SIGKILL, false).map_err(|e| {
+            RuntimeServiceError::KillError { sandbox_id, error: e.to_string() }
+        })?;
+        Ok(Response::new(StopPodSandboxResponse {}))
     }
 
     async fn remove_pod_sandbox(
         &self,
-        _request: Request<RemovePodSandboxRequest>,
+        request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
-        // TODO: Delete sandbox from cache
-        // TODO: Ensure /var/run/aurae/pods/$container_name is destroyed
-        todo!()
+        let mut sandboxes = self.sandboxes.lock().await;
+        sandboxes.remove(&request.into_inner().pod_sandbox_id)?;
+        Ok(Response::new(RemovePodSandboxResponse {}))
     }
 
     async fn pod_sandbox_status(
         &self,
-        _request: Request<PodSandboxStatusRequest>,
+        request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
-        // TODO: Pull sandbox from cache
-        // TODO: sandbox.status() // TODO consider a status append system where we add our own fields? Maybe enums?
-        todo!()
+        let sandbox_id = request.into_inner().pod_sandbox_id;
+        let sandboxes = self.sandboxes.lock().await;
+        let status = sandboxes.get(&sandbox_id)?.status();
+        let container_status = ContainerStatus {
+            id: sandbox_id,
+            state: status as i32,
+
+            ..Default::default()
+        };
+        Ok(Response::new(PodSandboxStatusResponse {
+            status: None,
+            info: Default::default(),
+            containers_statuses: vec![container_status],
+            timestamp: Utc::now().timestamp(),
+        }))
     }
 
     async fn list_pod_sandbox(
         &self,
         _request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
-        // TODO: Pull all sandboxes from cache
-        todo!()
+        // TODO: filter
+        let sandboxes = self.sandboxes.lock().await;
+        let all_sandboxes = sandboxes.list()?;
+        Ok(Response::new(ListPodSandboxResponse {
+            items: all_sandboxes
+                .iter()
+                .map(|s| PodSandbox {
+                    // TODO: other fields
+                    id: s.id().to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        }))
     }
 
     async fn create_container(
