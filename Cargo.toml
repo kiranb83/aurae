@@ -36,7 +36,7 @@ members = [
     "auraescript",
     "aurae-client",
     "ebpf-shared",
-    "aurae-proto",
+    "proto",
 ]
 
 exclude = [
@@ -46,7 +46,7 @@ exclude = [
 [workspace.dependencies]
 anyhow = "1.0.66"
 aurae-client = { path = "./aurae-client" }
-aurae-proto = { path = "./aurae-proto" }
+proto = { path = "./proto" }
 clap = { version = "4.1.1", features = ["derive"] }
 fancy-regex = "0.10.0"
 heck = "0.4.0"

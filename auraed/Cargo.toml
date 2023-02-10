@@ -42,7 +42,7 @@ path = "src/bin/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 aurae-client = { workspace = true }
-aurae-proto = { workspace = true }
+proto = { workspace = true }
 aurae-ebpf-shared = { path = "../ebpf-shared" }
 aya = { version = ">=0.11", features=["async_tokio"] }
 aya-log = "0.1"
