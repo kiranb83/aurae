@@ -35,7 +35,7 @@ use aurae_proto::cri::{
     runtime_service_server, AttachRequest, AttachResponse,
     CheckpointContainerRequest, CheckpointContainerResponse,
     ContainerEventResponse, ContainerStatsRequest, ContainerStatsResponse,
-    ContainerStatus, ContainerStatusRequest, ContainerStatusResponse,
+    ContainerStatusRequest, ContainerStatusResponse,
     CreateContainerRequest, CreateContainerResponse, ExecRequest, ExecResponse,
     ExecSyncRequest, ExecSyncResponse, GetEventsRequest,
     ListContainerStatsRequest, ListContainerStatsResponse,
@@ -56,7 +56,7 @@ use aurae_proto::cri::{
     UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
 use chrono::Utc;
-use libcontainer::container::{builder::ContainerBuilder, Container};
+use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::syscall::syscall::create_syscall;
 use nix::sys::signal::Signal;
 use std::{path::Path, sync::Arc};
@@ -111,6 +111,9 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         if windows.is_some() {
             panic!("Windows architecture is currently unsupported.") // TODO Unsure if we want to panic here?
         }
+
+        let mut sandboxes = self.sandboxes.lock().await;
+
         // Extract the metadata (name, uid, etc)
         let metadata = config.clone().metadata.expect("metadata from config");
         let sandbox_id = metadata.name;
@@ -125,8 +128,7 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         // TODO Switch on "WASM" which is a field that we will add to the RunPodSandboxRequest
         // TODO We made the decision to create a "KernelSpec" *name structure that will be how we distinguish between VMs and Containers
 
-        let mut sandbox: Option<Container>;
-        {
+        let sandbox = {
             // Initialize a new container builder with the AURAE_SELF_IDENTIFIER name as the "init" container running a recursive Auraed
             let syscall = create_syscall();
             let sandbox_builder = ContainerBuilder::new(
@@ -144,7 +146,7 @@ impl runtime_service_server::RuntimeService for RuntimeService {
                 oci_builder.build().expect("building pod oci spec"),
             );
 
-            sandbox = Some(sandbox_builder
+            let mut sandbox = Some(sandbox_builder
                 .with_root_path(Path::new(AURAE_PODS_PATH).join(sandbox_id.clone()))
                 .expect("Setting pods directory")
                 .as_init(Path::new(AURAE_BUNDLE_PATH).join(AURAE_SELF_IDENTIFIER))
@@ -157,13 +159,13 @@ impl runtime_service_server::RuntimeService for RuntimeService {
                 .expect("a sandbox")
                 .start()
                 .expect("starting pod sandbox");
-        }
+            sandbox
+        };
 
         // NOTE: we're creating a libcontainer::container and calling it `sandbox`,
         // so that's what goes in the cache.  but i think the rest of this service
         // differentiates between the outer "pod" and the inner "container"s so we
         // might want to do the same.
-        let mut sandboxes = self.sandboxes.lock().await;
         sandboxes.add(sandbox_id.clone(), sandbox.expect("a sandbox"))?;
 
         Ok(Response::new(RunPodSandboxResponse { pod_sandbox_id: sandbox_id }))
@@ -187,8 +189,12 @@ impl runtime_service_server::RuntimeService for RuntimeService {
         &self,
         request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
+        let sandbox_id = request.into_inner().pod_sandbox_id;
         let mut sandboxes = self.sandboxes.lock().await;
-        sandboxes.remove(&request.into_inner().pod_sandbox_id)?;
+        if sandboxes.get(&sandbox_id)?.status() != libcontainer::container::ContainerStatus::Stopped {
+            return Err(RuntimeServiceError::SandboxNotExited {sandbox_id }.into());
+        }
+        sandboxes.remove(&sandbox_id)?;
         Ok(Response::new(RemovePodSandboxResponse {}))
     }
 
@@ -198,10 +204,11 @@ impl runtime_service_server::RuntimeService for RuntimeService {
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
         let sandbox_id = request.into_inner().pod_sandbox_id;
         let sandboxes = self.sandboxes.lock().await;
-        let status = sandboxes.get(&sandbox_id)?.status();
-        let container_status = ContainerStatus {
+        let state = sandboxes.get(&sandbox_id)?.status();
+        // FIXME: this needs to be mapped more correctly.
+        let container_status = aurae_proto::cri::ContainerStatus {
             id: sandbox_id,
-            state: status as i32,
+            state: state as i32,
 
             ..Default::default()
         };
